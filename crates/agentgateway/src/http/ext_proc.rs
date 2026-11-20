@@ -1,6 +1,7 @@
-use std::convert::Infallible;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+use std::task::Poll;
+use std::time::Duration;
 
 use anyhow::anyhow;
 use bytes::Bytes;
@@ -43,9 +44,43 @@ const TRACE_POLICY_KIND: &str = "ext_proc";
 const INFERENCE_DESTINATION_HEADER: HeaderName =
 	HeaderName::from_static("x-gateway-destination-endpoint");
 
+/// Default for `ExtProc.messageTimeout`: how long a message sent to the processor may stay without
+/// any response before the processor is declared stalled. `0s` disables the deadline.
+pub const DEFAULT_MESSAGE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// One item on the channels through which ext_proc feeds the processed request/response body.
+///
+/// The error half carries a failure that happens after the headers were already committed
+/// (processor crashed, closed the stream before the body completed, stalled past the message
+/// timeout). The HTTP layer turns a body error into an aborted stream (h1: connection closed
+/// without the terminating chunk, h2: RST_STREAM) instead of a clean end of body, so a truncated
+/// body can never be mistaken for a complete one.
+type BodyFrame = Result<Frame<Bytes>, BodyAbort>;
+
+/// Why the processed body was aborted. Deliberately free of any processor detail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum BodyAbort {
+	#[error("external processing stream ended before the body completed")]
+	StreamEnded,
+	#[error("external processing message timeout")]
+	MessageTimeout,
+	#[error("external processing failed")]
+	Failed,
+}
+
+impl BodyAbort {
+	fn stream_ended(timed_out: &AtomicBool) -> Self {
+		if timed_out.load(Ordering::Relaxed) {
+			BodyAbort::MessageTimeout
+		} else {
+			BodyAbort::StreamEnded
+		}
+	}
+}
+
 struct ResponseLoopContext<'a> {
 	response: Option<&'a mut http::Response>,
-	body_tx: &'a mut Sender<Result<Frame<Bytes>, Infallible>>,
+	body_tx: &'a mut Sender<BodyFrame>,
 	fsm: &'a mut ResponseFlowFsm,
 	send_headers: bool,
 	ignore_mode_override: bool,
@@ -54,7 +89,7 @@ struct ResponseLoopContext<'a> {
 
 struct RequestLoopContext<'a> {
 	request: Option<&'a mut http::Request>,
-	body_tx: &'a mut Sender<Result<Frame<Bytes>, Infallible>>,
+	body_tx: &'a mut Sender<BodyFrame>,
 	fsm: &'a mut RequestFlowFsm,
 	send_headers: bool,
 	ignore_mode_override: bool,
@@ -69,6 +104,10 @@ pub enum Error {
 	NoMoreResponses,
 	#[error("no more responses")]
 	ResponseDropped,
+	#[error("timed out waiting for the external processor")]
+	MessageTimeout,
+	#[error("external processor failed before the response body started")]
+	ResponseAborted,
 	#[error("failed to buffer body: {0}")]
 	BodyBuffer(String),
 	#[error("invalid body mutation: {0}")]
@@ -218,6 +257,7 @@ impl InferenceRouting {
 					response_trailer_mode: TrailerSendMode::Send,
 					..Default::default()
 				},
+				None,
 			)),
 		}
 	}
@@ -302,6 +342,27 @@ pub struct ExtProc {
 	/// Controls which request and response parts are sent to the external processing service.
 	#[serde(default)]
 	pub processing_options: ProcessingOptions,
+	/// Maximum time a message sent to the external processing service may stay without any response
+	/// before the service is considered stalled (the Envoy `message_timeout` semantic).
+	///
+	/// A message counts as unanswered from the moment it is sent. The timer starts when a message is
+	/// sent while the processor owes no response, restarts on every response while more messages are
+	/// still unanswered, and stops when all were answered. A processor that deliberately collects
+	/// several body chunks before replying must reply within this time of the last response. Time the
+	/// gateway itself spends waiting for the upstream does not count.
+	///
+	/// When it fires, the processing stream is cancelled: the request fails with 504, or, once the
+	/// response body has started, the response body is aborted. With `failureMode: failOpen` a stall
+	/// before any body bytes were sent continues without processing.
+	///
+	/// Defaults to 60s. `0s` disables the deadline.
+	#[serde(
+		default,
+		skip_serializing_if = "Option::is_none",
+		with = "serde_dur_option"
+	)]
+	#[cfg_attr(feature = "schema", schemars(with = "Option<String>"))]
+	pub message_timeout: Option<Duration>,
 }
 
 impl ExtProc {
@@ -315,6 +376,7 @@ impl ExtProc {
 				self.request_attributes.clone(),
 				self.response_attributes.clone(),
 				self.processing_options,
+				self.message_timeout,
 			)),
 		}
 	}
@@ -420,6 +482,9 @@ struct ExtProcInstance {
 	rx_resp_for_request: Option<Receiver<ProcessingResponse>>,
 	rx_resp_for_response: Option<Receiver<ProcessingResponse>>,
 	cleanly_closed: Arc<AtomicBool>,
+	// Set when the processor stalled past `message_timeout` and the stream was cancelled.
+	timed_out: Arc<AtomicBool>,
+	message_timeout: Option<Duration>,
 	metadata_context: Option<HashMap<String, HashMap<String, Arc<cel::Expression>>>>,
 	req_attributes: Option<HashMap<String, Arc<cel::Expression>>>,
 	resp_attributes: Option<HashMap<String, Arc<cel::Expression>>>,
@@ -435,6 +500,7 @@ impl ExtProcInstance {
 		req_attributes: Option<HashMap<String, Arc<cel::Expression>>>,
 		resp_attributes: Option<HashMap<String, Arc<cel::Expression>>>,
 		processing_options: ProcessingOptions,
+		message_timeout: Option<Duration>,
 	) -> ExtProcInstance {
 		trace!("connecting to {:?}", target.target);
 		let client = client.with_outbound(OutboundCallKind::Policy, OutboundCallSubtype::ExtProc);
@@ -457,6 +523,12 @@ impl ExtProcInstance {
 			rx_resp_for_request: None,
 			rx_resp_for_response: None,
 			cleanly_closed: Arc::new(AtomicBool::new(false)),
+			timed_out: Arc::new(AtomicBool::new(false)),
+			message_timeout: match message_timeout {
+				None => Some(DEFAULT_MESSAGE_TIMEOUT),
+				Some(d) if d.is_zero() => None,
+				Some(d) => Some(d),
+			},
 			metadata_context,
 			req_attributes,
 			resp_attributes,
@@ -476,6 +548,8 @@ impl ExtProcInstance {
 		};
 		let failure_mode = self.failure_mode;
 		let cleanly_closed = self.cleanly_closed.clone();
+		let timed_out = self.timed_out.clone();
+		let message_timeout = self.message_timeout;
 		let span_client = self.span_client.clone();
 		let span_target = self.span_target.clone();
 		let (tx_req, mut rx_req) = tokio::sync::mpsc::channel(10);
@@ -485,11 +559,25 @@ impl ExtProcInstance {
 		// so mutate_request can keep the original HTTP body untouched during setup.
 		let (tx_polled, rx_polled) = tokio::sync::oneshot::channel();
 		let mut tx_polled = Some(tx_polled);
+		// (unanswered messages, time of the last progress). Progress is a message sent while none was
+		// unanswered, or a response. Only maintained when a message timeout is configured.
+		let pending = Arc::new(tokio::sync::watch::channel((0usize, tokio::time::Instant::now())).0);
+		let pending_on_send = pending.clone();
+		let track_pending = message_timeout.is_some();
 		let req_stream = futures::stream::poll_fn(move |cx| {
 			if let Some(tx) = tx_polled.take() {
 				let _ = tx.send(());
 			}
-			rx_req.poll_recv(cx)
+			let poll = rx_req.poll_recv(cx);
+			if track_pending && matches!(poll, Poll::Ready(Some(_))) {
+				pending_on_send.send_modify(|(unanswered, since)| {
+					if *unanswered == 0 {
+						*since = tokio::time::Instant::now();
+					}
+					*unanswered += 1;
+				});
+			}
+			poll
 		});
 		dtrace::spawn(async move {
 			let mut request = tonic::Request::new(req_stream);
@@ -512,9 +600,26 @@ impl ExtProcInstance {
 			trace!("initial stream established");
 			let mut responses = responses.into_inner();
 			loop {
-				match responses.message().await {
+				let Some(next) = Self::next_response(&mut responses, &pending, message_timeout).await else {
+					if let Some(span) = span.as_deref_mut() {
+						span.record_grpc_status(tonic::Code::DeadlineExceeded);
+					}
+					warn!(
+						?failure_mode,
+						"ext_proc message timeout: no response from the processor, cancelling the stream"
+					);
+					timed_out.store(true, Ordering::Relaxed);
+					return;
+				};
+				match next {
 					Ok(Some(item)) => {
 						trace!("received response item {item:?}");
+						if track_pending {
+							pending.send_modify(|(unanswered, since)| {
+								*unanswered = unanswered.saturating_sub(1);
+								*since = tokio::time::Instant::now();
+							});
+						}
 						if tx_resp.send(item).await.is_err() {
 							return;
 						}
@@ -570,6 +675,45 @@ impl ExtProcInstance {
 		Ok(())
 	}
 
+	/// Waits for the next message from the processor. Returns `None` when a message timeout is
+	/// configured and a message sent to the processor stayed unanswered for that long.
+	async fn next_response(
+		responses: &mut tonic::Streaming<ProcessingResponse>,
+		pending: &tokio::sync::watch::Sender<(usize, tokio::time::Instant)>,
+		timeout: Option<Duration>,
+	) -> Option<Result<Option<ProcessingResponse>, tonic::Status>> {
+		let Some(timeout) = timeout else {
+			return Some(responses.message().await);
+		};
+		let mut armed_rx = pending.subscribe();
+		let next = responses.message();
+		tokio::pin!(next);
+		loop {
+			let (unanswered, since) = *armed_rx.borrow_and_update();
+			let expired = async {
+				if unanswered > 0 {
+					tokio::time::sleep_until(since + timeout).await
+				} else {
+					std::future::pending().await
+				}
+			};
+			tokio::select! {
+				r = &mut next => return Some(r),
+				_ = expired => return None,
+				// A send or a response changed the state: recompute the deadline.
+				_ = armed_rx.changed() => {},
+			}
+		}
+	}
+
+	fn stream_end_error(&self) -> Error {
+		if self.timed_out.load(Ordering::Relaxed) {
+			Error::MessageTimeout
+		} else {
+			Error::NoMoreResponses
+		}
+	}
+
 	async fn send_request(&mut self, req: ProcessingRequest) -> Result<(), Error> {
 		let result = self
 			.tx_req
@@ -581,6 +725,9 @@ impl ExtProcInstance {
 		if result.is_err() && self.cleanly_closed.load(Ordering::Relaxed) {
 			self.skipped = true;
 			return Ok(());
+		}
+		if result.is_err() && self.timed_out.load(Ordering::Relaxed) {
+			return Err(Error::MessageTimeout);
 		}
 		result
 	}
@@ -737,6 +884,7 @@ impl ExtProcInstance {
 		trailer_slot: Option<Arc<Mutex<Option<http::HeaderMap>>>>,
 		first_message: FirstExtProcMessage,
 		missing_body_message: &'static str,
+		abort_tx: &Sender<BodyFrame>,
 	) {
 		tokio::task::spawn(Self::handle_body_stream(
 			metadata_context.clone(),
@@ -746,15 +894,21 @@ impl ExtProcInstance {
 			send_trailers,
 			trailer_slot,
 			first_message,
+			Some(abort_tx.downgrade()),
 		));
 	}
 
 	async fn recv_response_loop_message(
 		rx: &mut Receiver<ProcessingResponse>,
+		timed_out: &AtomicBool,
 	) -> Result<ResponseLoopMessage, Error> {
 		let Some(presp) = rx.recv().await else {
 			trace!("done receiving response");
-			return Err(Error::NoMoreResponses);
+			return Err(if timed_out.load(Ordering::Relaxed) {
+				Error::MessageTimeout
+			} else {
+				Error::NoMoreResponses
+			});
 		};
 		if let Some(dr) = to_immediate_response(&presp) {
 			trace!("got immediate response in request handler");
@@ -836,18 +990,38 @@ impl ExtProcInstance {
 		})
 	}
 
+	/// Forwards the rest of the response body after the response headers were committed. Anything
+	/// but a processor-signalled end of the body (stream closed or failed, stall, bad mutation)
+	/// aborts the downstream body: the original body was consumed, so there is nothing to fall back
+	/// to, and ending it cleanly would present a truncated body as complete.
+	///
+	/// `first_outcome` reports whether the processor delivered any message after the headers; the
+	/// caller holds the response back until then when the failure can still become a clean status.
 	async fn forward_response_stream_continuation(
 		mut rx: Receiver<ProcessingResponse>,
-		mut tx_chunk: Sender<Result<Frame<Bytes>, Infallible>>,
+		mut tx_chunk: Sender<BodyFrame>,
 		response_trailers: Arc<Mutex<Option<http::HeaderMap>>>,
 		send_response_body: bool,
 		send_response_headers: bool,
+		timed_out: Arc<AtomicBool>,
+		mut first_outcome: Option<tokio::sync::oneshot::Sender<Result<(), Error>>>,
 	) {
 		loop {
 			let Some(presp) = rx.recv().await else {
-				trace!("done receiving response");
+				warn!("ext_proc stream ended before the response body completed; aborting the response");
+				let abort = BodyAbort::stream_ended(&timed_out);
+				if let Some(first) = first_outcome.take() {
+					let _ = first.send(Err(match abort {
+						BodyAbort::MessageTimeout => Error::MessageTimeout,
+						_ => Error::ResponseAborted,
+					}));
+				}
+				let _ = tx_chunk.send(Err(abort)).await;
 				return;
 			};
+			if let Some(first) = first_outcome.take() {
+				let _ = first.send(Ok(()));
+			}
 			let response = handle_response_for_response_mutation(
 				send_response_body,
 				send_response_headers,
@@ -862,6 +1036,7 @@ impl ExtProcInstance {
 				Ok(response) => response,
 				Err(error) => {
 					warn!("response stream mutation failed: {error}");
+					let _ = tx_chunk.send(Err(BodyAbort::Failed)).await;
 					return;
 				},
 			};
@@ -871,6 +1046,27 @@ impl ExtProcInstance {
 				return;
 			}
 		}
+	}
+
+	// Not inlined into `mutate_response_inner`: the future is boxed so it does not count against
+	// the size budget of the `mutate_response` future.
+	fn spawn_response_continuation(
+		rx: Receiver<ProcessingResponse>,
+		tx_chunk: Sender<BodyFrame>,
+		response_trailers: Arc<Mutex<Option<http::HeaderMap>>>,
+		send_response_headers: bool,
+		timed_out: Arc<AtomicBool>,
+		first_outcome: Option<tokio::sync::oneshot::Sender<Result<(), Error>>>,
+	) {
+		tokio::task::spawn(Box::pin(Self::forward_response_stream_continuation(
+			rx,
+			tx_chunk,
+			response_trailers,
+			true,
+			send_response_headers,
+			timed_out,
+			first_outcome,
+		)));
 	}
 
 	fn protocol_config(&self) -> ProtocolConfiguration {
@@ -1048,6 +1244,7 @@ impl ExtProcInstance {
 				Some(request_trailers.clone()),
 				first_message,
 				"request body should be available before streaming starts",
+				&tx_chunk,
 			);
 			self.mark_protocol_config_sent_if(sends_protocol_config);
 			request_body_started_to_ext_proc = true;
@@ -1126,7 +1323,7 @@ impl ExtProcInstance {
 					return Ok((req, None));
 				}
 				trace!("done receiving request");
-				return Err(Error::NoMoreResponses);
+				return Err(self.stream_end_error());
 			};
 			if let Some(resp) = to_immediate_response(&presp) {
 				trace!("got immediate response in request handler");
@@ -1259,6 +1456,7 @@ impl ExtProcInstance {
 						Some(request_trailers.clone()),
 						first_message,
 						"request body should be available before streaming continuation starts",
+						&tx_chunk,
 					);
 					self.mark_protocol_config_sent_if(sends_protocol_config);
 				}
@@ -1268,12 +1466,14 @@ impl ExtProcInstance {
 					trace!("spawn body!");
 					let immediate_response = self.request_body_immediate_response.clone();
 					let request_trailers = request_trailers.clone();
+					let timed_out = self.timed_out.clone();
 					// Move remaining body response handling to an async task so we can return
 					// the request to the caller while body chunks continue to flow.
 					tokio::task::spawn(async move {
 						loop {
 							let Some(presp) = rx.recv().await else {
-								trace!("done receiving request");
+								warn!("ext_proc stream ended before the request body completed; aborting the request body");
+								let _ = tx_chunk.send(Err(BodyAbort::stream_ended(&timed_out))).await;
 								return;
 							};
 							if let Some(resp) = to_immediate_response(&presp) {
@@ -1295,6 +1495,7 @@ impl ExtProcInstance {
 								Ok(response) => response,
 								Err(error) => {
 									warn!("request stream mutation failed: {error}");
+									let _ = tx_chunk.send(Err(BodyAbort::Failed)).await;
 									return;
 								},
 							};
@@ -1327,6 +1528,7 @@ impl ExtProcInstance {
 		send_trailers: bool,
 		trailer_slot: Option<Arc<Mutex<Option<http::HeaderMap>>>>,
 		first_message: FirstExtProcMessage,
+		abort_tx: Option<tokio::sync::mpsc::WeakSender<BodyFrame>>,
 	) {
 		if let Err(error) = Self::send_body_stream(
 			metadata_context,
@@ -1342,7 +1544,15 @@ impl ExtProcInstance {
 		{
 			match error {
 				Error::RequestSend => trace!("body stream stopped after ext_proc request channel closed"),
-				error => warn!("body stream stopped: {error}"),
+				error => {
+					warn!("body stream stopped: {error}");
+					// The source body failed (upstream reset or idle timeout, client abort): the
+					// processor never sees the end of the body, so do not let the processed body end
+					// cleanly either.
+					if let Some(abort_tx) = abort_tx.as_ref().and_then(|w| w.upgrade()) {
+						let _ = abort_tx.send(Err(BodyAbort::Failed)).await;
+					}
+				},
 			}
 		}
 	}
@@ -1429,7 +1639,7 @@ impl ExtProcInstance {
 
 	async fn forward_body_to_channel(
 		mut body: http::Body,
-		tx_chunk: Sender<Result<Frame<Bytes>, Infallible>>,
+		tx_chunk: Sender<BodyFrame>,
 		body_error_message: &'static str,
 	) -> Result<(), Error> {
 		while let Some(frame) = body
@@ -1448,14 +1658,19 @@ impl ExtProcInstance {
 
 	fn spawn_forward_body_to_channel(
 		body: http::Body,
-		tx_chunk: Sender<Result<Frame<Bytes>, Infallible>>,
+		tx_chunk: Sender<BodyFrame>,
 		body_error_message: &'static str,
 	) {
 		tokio::task::spawn(async move {
-			if let Err(error) = Self::forward_body_to_channel(body, tx_chunk, body_error_message).await {
+			if let Err(error) =
+				Self::forward_body_to_channel(body, tx_chunk.clone(), body_error_message).await
+			{
 				match error {
 					Error::RequestSend => trace!("body remainder stopped after body channel closed"),
-					error => warn!("body remainder stopped: {error}"),
+					error => {
+						warn!("body remainder stopped: {error}");
+						let _ = tx_chunk.send(Err(BodyAbort::Failed)).await;
+					},
 				}
 			}
 		});
@@ -1468,9 +1683,14 @@ impl ExtProcInstance {
 		resolved_destination_metadata: Option<SocketAddr>,
 	) -> Result<(http::Response, Option<PolicyResponse>), Error> {
 		let rebuffer = response.body().needs_inspection();
-		let (mut response, policy_response) = self
-			.mutate_response_inner(response, request, resolved_destination_metadata)
-			.await?;
+		// Boxed: the response phase now carries the first-message hold-back state and would
+		// otherwise push `mutate_response` over the 4KiB future-size budget asserted by the caller.
+		let (mut response, policy_response) = Box::pin(self.mutate_response_inner(
+			response,
+			request,
+			resolved_destination_metadata,
+		))
+		.await?;
 		if rebuffer && self.mode_state.response_body_mode != BodySendMode::None {
 			let _ = http::inspect_response_body(&mut response)
 				.await
@@ -1598,6 +1818,7 @@ impl ExtProcInstance {
 				Some(response_trailers.clone()),
 				first_message,
 				"response body should be available before streaming starts",
+				&tx_chunk,
 			);
 			self.mark_protocol_config_sent_if(sends_protocol_config);
 		} else if !send_response_headers && had_body {
@@ -1631,17 +1852,29 @@ impl ExtProcInstance {
 					Some(response_trailers.clone()),
 					first_message,
 					"response body should be available before streaming starts",
+					&tx_chunk,
 				);
 				self.mark_protocol_config_sent_if(sends_protocol_config);
 			}
 		}
+		// Once the headers are committed a processor failure can only abort the body. For a
+		// response that is not a stream, hold it back until the processor delivered its first message
+		// after the headers: a processor that dies right there then yields a 502/504 status instead of
+		// a 200 with an aborted body. Event streams are never held back, their headers must not wait
+		// for the first event.
+		let (mut first_tx, mut first_rx) = if had_body && !is_streaming_content_type(resp.headers()) {
+			let (tx, rx) = tokio::sync::oneshot::channel();
+			(Some(tx), Some(rx))
+		} else {
+			(None, None)
+		};
 
 		let mut rx = self
 			.rx_resp_for_response
 			.take()
 			.expect("mutate_response called twice");
 		loop {
-			let msg = Self::recv_response_loop_message(&mut rx).await?;
+			let msg = Self::recv_response_loop_message(&mut rx, &self.timed_out).await?;
 			let (transitioned, eos, streamed_body_mutation) = match msg {
 				ResponseLoopMessage::Immediate(dr) => return Ok((resp, Some(dr))),
 				ResponseLoopMessage::Processing(presp) => {
@@ -1747,17 +1980,19 @@ impl ExtProcInstance {
 							Some(response_trailers.clone()),
 							first_message,
 							"response body should be available before streaming continuation starts",
+							&tx_chunk,
 						);
 						self.mark_protocol_config_sent_if(sends_protocol_config);
 					}
 					response_fsm.enter_streaming_continuation();
-					tokio::task::spawn(Self::forward_response_stream_continuation(
+					Self::spawn_response_continuation(
 						rx,
 						tx_chunk,
 						response_trailers.clone(),
-						true,
 						send_response_headers,
-					));
+						self.timed_out.clone(),
+						first_tx.take(),
+					);
 				} else if !eos
 					&& response_fsm.send_body
 					&& response_fsm.body_path == BodyPath::Buffered
@@ -1767,13 +2002,14 @@ impl ExtProcInstance {
 						.is_some()
 				{
 					response_fsm.enter_streaming_continuation();
-					tokio::task::spawn(Self::forward_response_stream_continuation(
+					Self::spawn_response_continuation(
 						rx,
 						tx_chunk,
 						response_trailers.clone(),
-						true,
 						send_response_headers,
-					));
+						self.timed_out.clone(),
+						first_tx.take(),
+					);
 				}
 				if response_fsm.send_body
 					&& (response_fsm
@@ -1783,10 +2019,42 @@ impl ExtProcInstance {
 				{
 					resp.headers_mut().remove(http::header::CONTENT_LENGTH);
 				}
+				// The continuation was started: hold a non-streaming response back until the processor
+				// delivered its first message after the headers (see `first_tx` above).
+				if first_tx.is_none()
+					&& let Some(first_rx) = first_rx.take()
+				{
+					match first_rx.await {
+						Ok(Ok(())) => {},
+						Ok(Err(error)) => return Err(error),
+						Err(_) => return Err(Error::ResponseAborted),
+					}
+				}
 				return Ok((resp, None));
 			}
 		}
 	}
+}
+
+/// Whether a response is a long-lived stream whose headers must not wait for its first frame.
+fn is_streaming_content_type(headers: &http::HeaderMap) -> bool {
+	let Some(content_type) = headers
+		.get(http::header::CONTENT_TYPE)
+		.and_then(|v| v.to_str().ok())
+	else {
+		return false;
+	};
+	let content_type = content_type.to_ascii_lowercase();
+	[
+		"event-stream",
+		"eventstream",
+		"ndjson",
+		"jsonl",
+		"stream+json",
+		"grpc",
+	]
+	.iter()
+	.any(|t| content_type.contains(t))
 }
 
 fn eval_expression(exec: &Executor, v: &Expression) -> Result<prost_wkt_types::Value, ProxyError> {

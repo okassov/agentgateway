@@ -1836,6 +1836,451 @@ mod immediate_and_failure {
 	}
 }
 
+// Failures after the headers were committed must abort the body instead of ending it cleanly,
+// and a stalled processor must be cut off by the message timeout.
+mod stream_failure_and_message_timeout {
+	use super::*;
+	use crate::proxy::ProxyError;
+
+	#[derive(Debug, Clone, Copy)]
+	enum Fault {
+		/// The processor ends the stream with a gRPC error.
+		StatusError,
+		/// The processor ends the stream with status OK before the body completed.
+		CleanClose,
+		/// The processor stops answering but keeps the stream open.
+		Stall,
+	}
+
+	/// Echoes body chunks of both directions; the configured direction fails once `after` chunks
+	/// were echoed.
+	#[derive(Debug)]
+	struct FaultAfterChunks {
+		request_side: bool,
+		after: usize,
+		seen: usize,
+		fault: Fault,
+		closing: bool,
+	}
+
+	impl FaultAfterChunks {
+		fn request(after: usize, fault: Fault) -> Self {
+			Self {
+				request_side: true,
+				after,
+				seen: 0,
+				fault,
+				closing: false,
+			}
+		}
+
+		fn response(after: usize, fault: Fault) -> Self {
+			Self {
+				request_side: false,
+				..Self::request(after, fault)
+			}
+		}
+
+		async fn chunk(
+			&mut self,
+			request_side: bool,
+			body: &proto::HttpBody,
+			sender: &mpsc::Sender<Result<ProcessingResponse, Status>>,
+		) -> Result<(), Status> {
+			if request_side == self.request_side {
+				if self.seen >= self.after {
+					match self.fault {
+						Fault::StatusError => return Err(Status::unavailable("injected failure")),
+						Fault::CleanClose => {
+							self.closing = true;
+							return Ok(());
+						},
+						Fault::Stall => std::future::pending::<()>().await,
+					}
+				}
+				self.seen += 1;
+			}
+			let cr = CommonResponse {
+				body_mutation: Some(BodyMutation {
+					mutation: Some(body_mutation::Mutation::StreamedResponse(
+						proto::StreamedBodyResponse {
+							body: body.body.clone(),
+							end_of_stream: body.end_of_stream,
+						},
+					)),
+				}),
+				..Default::default()
+			};
+			let _ = sender
+				.send(if request_side {
+					request_body_response(Some(cr))
+				} else {
+					response_body_response(Some(cr))
+				})
+				.await;
+			Ok(())
+		}
+	}
+
+	#[async_trait::async_trait]
+	impl Handler for FaultAfterChunks {
+		async fn handle_request_body(
+			&mut self,
+			body: &proto::HttpBody,
+			sender: &mpsc::Sender<Result<ProcessingResponse, Status>>,
+		) -> Result<(), Status> {
+			self.chunk(true, body, sender).await
+		}
+
+		async fn handle_response_body(
+			&mut self,
+			body: &proto::HttpBody,
+			sender: &mpsc::Sender<Result<ProcessingResponse, Status>>,
+		) -> Result<(), Status> {
+			self.chunk(false, body, sender).await
+		}
+
+		fn close_stream(&self) -> bool {
+			self.closing
+		}
+	}
+
+	/// Never answers the request headers.
+	#[derive(Debug, Default)]
+	struct StallOnRequestHeaders;
+
+	#[async_trait::async_trait]
+	impl Handler for StallOnRequestHeaders {
+		async fn handle_request_headers(
+			&mut self,
+			_: &HttpHeaders,
+			_: &mpsc::Sender<Result<ProcessingResponse, Status>>,
+		) -> Result<(), Status> {
+			std::future::pending::<()>().await;
+			Ok(())
+		}
+	}
+
+	fn full_duplex_options() -> ext_proc::ProcessingOptions {
+		ext_proc::ProcessingOptions {
+			request_body_mode: ext_proc::BodySendMode::FullDuplexStreamed,
+			response_body_mode: ext_proc::BodySendMode::FullDuplexStreamed,
+			request_header_mode: ext_proc::HeaderSendMode::Send,
+			response_header_mode: ext_proc::HeaderSendMode::Send,
+			request_trailer_mode: ext_proc::TrailerSendMode::Skip,
+			response_trailer_mode: ext_proc::TrailerSendMode::Skip,
+			..Default::default()
+		}
+	}
+
+	fn ext_proc_request(
+		addr: std::net::SocketAddr,
+		processing_options: ext_proc::ProcessingOptions,
+		failure_mode: ext_proc::FailureMode,
+		message_timeout: Option<Duration>,
+	) -> ext_proc::ExtProcRequest {
+		let bind = setup_proxy_test("{}").unwrap().with_backend(addr);
+		let client = crate::proxy::httpproxy::PolicyClient::new(bind.inputs());
+		ext_proc::ExtProc {
+			target: crate::types::agent::SimpleBackendReferenceWithPolicies {
+				target: Arc::new(crate::types::agent::SimpleBackendReference::Backend(
+					strng::format!("/{}", addr),
+				)),
+				policies: Vec::new(),
+			},
+			failure_mode,
+			message_timeout,
+			metadata_context: None,
+			request_attributes: None,
+			response_attributes: None,
+			processing_options,
+		}
+		.build(client)
+	}
+
+	fn chunk_body(chunks: usize) -> Body {
+		let frames: Vec<_> = (0..chunks)
+			.map(|i| Ok::<_, Infallible>(Frame::data(Bytes::from(format!("c{i}")))))
+			.collect();
+		Body::new(http_body_util::StreamBody::new(tokio_stream::iter(frames)))
+	}
+
+	fn response_with(content_type: &str, chunks: usize) -> http::Response {
+		let mut resp = http::Response::new(chunk_body(chunks));
+		resp
+			.headers_mut()
+			.insert(::http::header::CONTENT_TYPE, content_type.parse().unwrap());
+		resp
+	}
+
+	/// Reads a body to its end. Returns the data received and, when the body did not end
+	/// cleanly, the error it ended with.
+	async fn drain(body: Body) -> (Vec<u8>, Option<String>) {
+		let mut body = std::pin::pin!(body);
+		let mut data = Vec::new();
+		loop {
+			match tokio::time::timeout(Duration::from_secs(10), body.frame())
+				.await
+				.expect("body neither ended nor failed")
+			{
+				None => return (data, None),
+				Some(Ok(frame)) => {
+					if let Ok(d) = frame.into_data() {
+						data.extend_from_slice(&d);
+					}
+				},
+				Some(Err(e)) => return (data, Some(e.to_string())),
+			}
+		}
+	}
+
+	async fn assert_stream_aborted(fault: Fault) {
+		let ext_proc = ExtProcMock::new(move || FaultAfterChunks::response(2, fault))
+			.spawn()
+			.await;
+		let mut ep = ext_proc_request(
+			ext_proc.address,
+			full_duplex_options(),
+			ext_proc::FailureMode::FailClosed,
+			None,
+		);
+		let mut resp = response_with("text/event-stream", 5);
+		let _ = ep.mutate_response(&mut resp, None).await.unwrap();
+		let (data, err) = drain(resp.into_body()).await;
+		assert_eq!(data, b"c0c1");
+		assert!(
+			err.is_some(),
+			"a processor failure after the headers must not look like a complete body"
+		);
+	}
+
+	#[tokio::test]
+	async fn response_stream_grpc_error_aborts_the_body() {
+		assert_stream_aborted(Fault::StatusError).await;
+	}
+
+	#[tokio::test]
+	async fn response_stream_clean_close_before_the_end_aborts_the_body() {
+		assert_stream_aborted(Fault::CleanClose).await;
+	}
+
+	#[tokio::test]
+	async fn response_stream_stall_is_aborted_by_the_message_timeout() {
+		let ext_proc = ExtProcMock::new(|| FaultAfterChunks::response(2, Fault::Stall))
+			.spawn()
+			.await;
+		let mut ep = ext_proc_request(
+			ext_proc.address,
+			full_duplex_options(),
+			ext_proc::FailureMode::FailClosed,
+			Some(Duration::from_millis(300)),
+		);
+		let mut resp = response_with("text/event-stream", 5);
+		let _ = ep.mutate_response(&mut resp, None).await.unwrap();
+		let (data, err) = drain(resp.into_body()).await;
+		assert_eq!(data, b"c0c1");
+		let err = err.expect("a stalled processor must abort the body");
+		assert!(err.contains("message timeout"), "unexpected error: {err}");
+	}
+
+	#[tokio::test]
+	async fn zero_message_timeout_disables_the_deadline() {
+		let ext_proc = ExtProcMock::new(|| FaultAfterChunks::response(2, Fault::Stall))
+			.spawn()
+			.await;
+		let mut ep = ext_proc_request(
+			ext_proc.address,
+			full_duplex_options(),
+			ext_proc::FailureMode::FailClosed,
+			Some(Duration::ZERO),
+		);
+		let mut resp = response_with("text/event-stream", 5);
+		let _ = ep.mutate_response(&mut resp, None).await.unwrap();
+		// The default deadline is 60s; with 0s nothing may fire.
+		assert!(
+			tokio::time::timeout(Duration::from_millis(1200), drain(resp.into_body()))
+				.await
+				.is_err()
+		);
+	}
+
+	#[tokio::test]
+	async fn response_without_stall_is_not_cut_by_the_message_timeout() {
+		// Never faults: the fault position is beyond the number of chunks.
+		let ext_proc = ExtProcMock::new(|| FaultAfterChunks::response(usize::MAX, Fault::StatusError))
+			.spawn()
+			.await;
+		let mut ep = ext_proc_request(
+			ext_proc.address,
+			full_duplex_options(),
+			ext_proc::FailureMode::FailClosed,
+			Some(Duration::from_millis(300)),
+		);
+		let mut resp = response_with("text/event-stream", 5);
+		let _ = ep.mutate_response(&mut resp, None).await.unwrap();
+		let (data, err) = drain(resp.into_body()).await;
+		assert_eq!(data, b"c0c1c2c3c4");
+		assert_eq!(err, None);
+	}
+
+	#[tokio::test]
+	async fn non_stream_response_failure_after_the_headers_is_not_a_clean_empty_body() {
+		for fault in [Fault::StatusError, Fault::CleanClose] {
+			let ext_proc = ExtProcMock::new(move || FaultAfterChunks::response(0, fault))
+				.spawn()
+				.await;
+			let mut ep = ext_proc_request(
+				ext_proc.address,
+				full_duplex_options(),
+				ext_proc::FailureMode::FailClosed,
+				None,
+			);
+			let mut resp = response_with("application/json", 1);
+			let err = ep.mutate_response(&mut resp, None).await.unwrap_err();
+			assert!(
+				matches!(err, ProxyError::ExtProc(ext_proc::Error::ResponseAborted)),
+				"{fault:?}: {err:?}"
+			);
+		}
+	}
+
+	#[tokio::test]
+	async fn non_stream_response_failure_is_a_502_end_to_end() {
+		for fault in [Fault::StatusError, Fault::CleanClose] {
+			let mock = body_mock(b"upstream-response").await;
+			let processing_options = json!({
+				"requestBodyMode": "fullDuplexStreamed",
+				"responseBodyMode": "fullDuplexStreamed",
+				"requestHeaderMode": "send",
+				"responseHeaderMode": "send",
+				"requestTrailerMode": "send",
+				"responseTrailerMode": "send",
+			});
+			let (_mock, _ext_proc, _bind, io) = setup_ext_proc_mock_with_processing_options(
+				mock,
+				ext_proc::FailureMode::FailClosed,
+				ExtProcMock::new(move || FaultAfterChunks::response(0, fault)),
+				"{}",
+				Some(processing_options),
+			)
+			.await;
+			let res = send_request_body(io, Method::POST, "http://lo", b"request").await;
+			assert_eq!(res.status(), 502, "{fault:?}");
+		}
+	}
+
+	#[tokio::test]
+	async fn request_stream_clean_close_is_not_pass_through() {
+		let ext_proc = ExtProcMock::new(|| FaultAfterChunks::request(2, Fault::CleanClose))
+			.spawn()
+			.await;
+		let mut ep = ext_proc_request(
+			ext_proc.address,
+			full_duplex_options(),
+			ext_proc::FailureMode::FailClosed,
+			None,
+		);
+		let mut req = crate::proxy::request_builder::RequestBuilder::new(Method::POST, "http://lo")
+			.body(chunk_body(5))
+			.build()
+			.unwrap();
+		let _ = ep.mutate_request(&mut req).await.unwrap();
+		let (data, err) = drain(req.into_body()).await;
+		assert_eq!(data, b"c0c1");
+		assert!(
+			err.is_some(),
+			"a truncated request body must not be forwarded as complete"
+		);
+	}
+
+	#[tokio::test]
+	async fn request_body_clean_close_never_reaches_the_upstream_as_a_request() {
+		let mock = simple_mock().await;
+		let processing_options = json!({
+			"requestBodyMode": "fullDuplexStreamed",
+			"responseBodyMode": "fullDuplexStreamed",
+			"requestHeaderMode": "send",
+			"responseHeaderMode": "send",
+			"requestTrailerMode": "send",
+			"responseTrailerMode": "send",
+		});
+		let (mock, _ext_proc, _bind, io) = setup_ext_proc_mock_with_processing_options(
+			mock,
+			ext_proc::FailureMode::FailClosed,
+			ExtProcMock::new(|| FaultAfterChunks::request(0, Fault::CleanClose)),
+			"{}",
+			Some(processing_options),
+		)
+		.await;
+		let res = send_request_body(io, Method::POST, "http://lo", b"request").await;
+		assert!(
+			!res.status().is_success(),
+			"unexpected status {}",
+			res.status()
+		);
+		let upstream = mock.received_requests().await.unwrap_or_default();
+		assert!(
+			upstream.iter().all(|r| r.body.as_slice() != b"request"),
+			"the unprocessed body must not reach the upstream"
+		);
+	}
+
+	#[tokio::test]
+	async fn stalled_processor_fails_the_request_with_the_message_timeout() {
+		let ext_proc = ExtProcMock::new(StallOnRequestHeaders::default)
+			.spawn()
+			.await;
+		let mut ep = ext_proc_request(
+			ext_proc.address,
+			ext_proc::ProcessingOptions {
+				request_body_mode: ext_proc::BodySendMode::None,
+				..full_duplex_options()
+			},
+			ext_proc::FailureMode::FailClosed,
+			Some(Duration::from_millis(200)),
+		);
+		let mut req = crate::proxy::request_builder::RequestBuilder::new(Method::GET, "http://lo")
+			.build()
+			.unwrap();
+		let err = ep.mutate_request(&mut req).await.unwrap_err();
+		assert!(
+			matches!(err, ProxyError::ExtProc(ext_proc::Error::MessageTimeout)),
+			"{err:?}"
+		);
+	}
+
+	#[tokio::test]
+	async fn stalled_processor_fails_open_before_any_body_was_sent() {
+		let ext_proc = ExtProcMock::new(StallOnRequestHeaders::default)
+			.spawn()
+			.await;
+		let mut ep = ext_proc_request(
+			ext_proc.address,
+			ext_proc::ProcessingOptions {
+				request_body_mode: ext_proc::BodySendMode::None,
+				..full_duplex_options()
+			},
+			ext_proc::FailureMode::FailOpen,
+			Some(Duration::from_millis(200)),
+		);
+		let mut req = crate::proxy::request_builder::RequestBuilder::new(Method::GET, "http://lo")
+			.build()
+			.unwrap();
+		let _ = ep.mutate_request(&mut req).await.unwrap();
+	}
+
+	#[test]
+	fn message_timeout_is_configurable() {
+		let parse = |v: serde_json::Value| serde_json::from_value::<ext_proc::ExtProc>(v).unwrap();
+		let set = parse(json!({"host": "127.0.0.1:9000", "messageTimeout": "30s"}));
+		assert_eq!(set.message_timeout, Some(Duration::from_secs(30)));
+		let off = parse(json!({"host": "127.0.0.1:9000", "messageTimeout": "0s"}));
+		assert_eq!(off.message_timeout, Some(Duration::ZERO));
+		let unset = parse(json!({"host": "127.0.0.1:9000"}));
+		assert_eq!(unset.message_timeout, None);
+	}
+}
+
 // Dynamic metadata propagation through request/response extensions.
 mod dynamic_metadata_flow {
 	use super::*;
@@ -2404,6 +2849,7 @@ fn build_ext_proc_request_for_test(
 			policies: Vec::new(),
 		},
 		failure_mode: ext_proc::FailureMode::FailClosed,
+		message_timeout: None,
 		metadata_context: None,
 		request_attributes: None,
 		response_attributes: None,
@@ -5344,6 +5790,7 @@ mod body_streaming_and_trailers {
 			false,
 			None,
 			super::super::FirstExtProcMessage::default(),
+			None,
 		)
 		.await;
 
@@ -5378,6 +5825,7 @@ mod body_streaming_and_trailers {
 			true,
 			None,
 			super::super::FirstExtProcMessage::default(),
+			None,
 		)
 		.await;
 
@@ -5426,6 +5874,7 @@ mod body_streaming_and_trailers {
 			true,
 			None,
 			super::super::FirstExtProcMessage::default(),
+			None,
 		)
 		.await;
 

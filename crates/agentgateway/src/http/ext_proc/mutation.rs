@@ -1,7 +1,5 @@
-use std::convert::Infallible;
 use std::sync::Mutex;
 
-use bytes::Bytes;
 use http_body::Frame;
 use tokio::sync::mpsc::Sender;
 use tracing::{trace, warn};
@@ -11,7 +9,7 @@ use super::headers::{
 };
 use super::proto::body_mutation::Mutation;
 use super::proto::processing_response::Response;
-use super::{Error, ExtProcDynamicMetadata};
+use super::{BodyFrame, Error, ExtProcDynamicMetadata};
 use crate::http::ext_proc::proto::{
 	BodyMutation, BodyResponse, CommonResponse, HeaderMutation, HeadersResponse, ImmediateResponse,
 	ProcessingResponse,
@@ -97,7 +95,7 @@ pub(super) fn response_response_has_streamed_body_mutation(presp: &ProcessingRes
 
 async fn forward_trailers(
 	direction: &'static str,
-	body_tx: &mut Sender<Result<Frame<Bytes>, Infallible>>,
+	body_tx: &mut Sender<BodyFrame>,
 	trailer_slot: &Mutex<Option<::http::HeaderMap>>,
 	header_mutation: Option<&HeaderMutation>,
 ) -> bool {
@@ -117,7 +115,7 @@ pub(super) async fn handle_response_for_request_mutation(
 	allow_header_mutations: bool,
 	validate_content_length: bool,
 	mut req: Option<&mut http::Request>,
-	body_tx: &mut Sender<Result<Frame<Bytes>, Infallible>>,
+	body_tx: &mut Sender<BodyFrame>,
 	request_trailers: &Mutex<Option<::http::HeaderMap>>,
 	presp: ProcessingResponse,
 ) -> Result<(bool, bool), Error> {
@@ -252,7 +250,7 @@ pub(super) async fn handle_response_for_response_mutation(
 	allow_header_mutations: bool,
 	validate_content_length: bool,
 	mut resp: Option<&mut http::Response>,
-	body_tx: &mut Sender<Result<Frame<Bytes>, Infallible>>,
+	body_tx: &mut Sender<BodyFrame>,
 	response_trailers: &Mutex<Option<::http::HeaderMap>>,
 	presp: ProcessingResponse,
 ) -> Result<(bool, bool), Error> {

@@ -491,6 +491,8 @@ impl ProxyError {
 				http::auth::BackendAuthError::CredentialProvider(_) => StatusCode::BAD_GATEWAY,
 			},
 			ProxyError::InvalidBackendType => StatusCode::INTERNAL_SERVER_ERROR,
+			ProxyError::ExtProc(ext_proc::Error::MessageTimeout) => StatusCode::GATEWAY_TIMEOUT,
+			ProxyError::ExtProc(ext_proc::Error::ResponseAborted) => StatusCode::BAD_GATEWAY,
 			ProxyError::ExtProc(_) => StatusCode::INTERNAL_SERVER_ERROR,
 			ProxyError::CsrfValidationFailed => StatusCode::FORBIDDEN,
 
@@ -1107,6 +1109,14 @@ mod tests {
 			"text/plain"
 		);
 		assert!(response.headers().get("grpc-status").is_none());
+	}
+
+	#[test]
+	fn ext_proc_failures_after_the_upstream_answered_are_gateway_errors() {
+		let status = |e: ext_proc::Error| ProxyError::ExtProc(e).into_response_with_grpc(false).status();
+		assert_eq!(status(ext_proc::Error::ResponseAborted), StatusCode::BAD_GATEWAY);
+		assert_eq!(status(ext_proc::Error::MessageTimeout), StatusCode::GATEWAY_TIMEOUT);
+		assert_eq!(status(ext_proc::Error::NoMoreResponses), StatusCode::INTERNAL_SERVER_ERROR);
 	}
 
 	#[test]

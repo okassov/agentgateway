@@ -1,4 +1,3 @@
-use std::convert::Infallible;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -10,7 +9,7 @@ use pin_project_lite::pin_project;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio_stream::wrappers::ReceiverStream;
 
-use super::{BodySendMode, Error};
+use super::{BodyFrame, BodySendMode, Error};
 use crate::http::{self, bufferbody};
 
 pub(super) enum BufferedBodyPhase {
@@ -142,7 +141,7 @@ impl BufferedBodyPhase {
 	pub(super) async fn restore_original_if(
 		phase: &mut Option<Self>,
 		restore: bool,
-		body_tx: &mut Sender<Result<Frame<Bytes>, Infallible>>,
+		body_tx: &mut Sender<BodyFrame>,
 	) {
 		if !restore {
 			return;
@@ -341,7 +340,7 @@ fn buffered_bytes(mut buffer: BufList) -> Bytes {
 
 pub(super) fn attach_request_body_channel(
 	req: http::Request,
-	rx_chunk: &mut Option<Receiver<Result<Frame<Bytes>, Infallible>>>,
+	rx_chunk: &mut Option<Receiver<BodyFrame>>,
 ) -> (http::Request, http::Body) {
 	let (parts, mut managed_body) = req.into_parts();
 	// Only input content goes to ext-proc. Recording and lifecycle observers
@@ -389,7 +388,7 @@ pub(super) fn start_buffered_request_body(
 	req: http::Request,
 	body_mode: BodySendMode,
 	had_body: bool,
-	rx_chunk: &mut Option<Receiver<Result<Frame<Bytes>, Infallible>>>,
+	rx_chunk: &mut Option<Receiver<BodyFrame>>,
 ) -> (http::Request, Option<BufferedBodyPhase>) {
 	if !should_buffer_body(body_mode, had_body) {
 		return (req, None);

@@ -7947,6 +7947,13 @@
             "responseTrailerMode": "send",
             "allowModeOverride": false
           }
+        },
+        "messageTimeout": {
+          "description": "Maximum time a message sent to the external processing service may stay without any response\nbefore the service is considered stalled (the Envoy `message_timeout` semantic).\n\nA message counts as unanswered from the moment it is sent. The timer starts when a message is\nsent while the processor owes no response, restarts on every response while more messages are\nstill unanswered, and stops when all were answered. A processor that deliberately collects\nseveral body chunks before replying must reply within this time of the last response. Time the\ngateway itself spends waiting for the upstream does not count.\n\nWhen it fires, the processing stream is cancelled: the request fails with 504, or, once the\nresponse body has started, the response body is aborted. With `failureMode: failOpen` a stall\nbefore any body bytes were sent continues without processing.\n\nDefaults to 60s. `0s` disables the deadline.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "oneOf": [
@@ -8178,6 +8185,13 @@
             "responseTrailerMode": "send",
             "allowModeOverride": false
           }
+        },
+        "messageTimeout": {
+          "description": "Maximum time a message sent to the external processing service may stay without any response\nbefore the service is considered stalled (the Envoy `message_timeout` semantic).\n\nA message counts as unanswered from the moment it is sent. The timer starts when a message is\nsent while the processor owes no response, restarts on every response while more messages are\nstill unanswered, and stops when all were answered. A processor that deliberately collects\nseveral body chunks before replying must reply within this time of the last response. Time the\ngateway itself spends waiting for the upstream does not count.\n\nWhen it fires, the processing stream is cancelled: the request fails with 504, or, once the\nresponse body has started, the response body is aborted. With `failureMode: failOpen` a stall\nbefore any body bytes were sent continues without processing.\n\nDefaults to 60s. `0s` disables the deadline.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "unevaluatedProperties": false,

@@ -3099,6 +3099,8 @@ fn traffic_policy_from_proto(
 					)
 				},
 				processing_options,
+				// The xDS ExtProc message has no message timeout field yet: use the default.
+				message_timeout: None,
 			}))
 		},
 		Some(tps::Kind::RequestHeaderModifier(rhm)) => {
